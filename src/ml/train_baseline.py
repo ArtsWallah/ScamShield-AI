@@ -1,29 +1,19 @@
+
 from pathlib import Path
 
-import numpy as np
+import joblib
 import pandas as pd
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.multiclass import OneVsRestClassifier
+from sklearn.metrics import f1_score, precision_score, recall_score
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import KFold, cross_validate
-from sklearn.metrics import (
-    f1_score,
-    precision_score,
-    recall_score,
-    classification_report,
-)
 
 
 ROOT = Path(__file__).resolve().parents[2]
-
-DATA_PATH = (
-    ROOT
-    / "data"
-    / "processed"
-    / "final_training_data.csv"
-)
+DATA_PATH = ROOT / "data" / "processed" / "final_training_data.csv"
+MODEL_PATH = ROOT / "models" / "tfidf_multilabel_baseline.joblib"
 
 TACTICS = [
     "authority",
@@ -37,73 +27,8 @@ TACTICS = [
 ]
 
 
-def main():
-
-    print("=" * 70)
-    print("SCAMSHIELD - TF-IDF MULTI-LABEL BASELINE")
-    print("=" * 70)
-
-    df = pd.read_csv(DATA_PATH)
-
-    print(f"\nTotal messages: {len(df)}")
-
-    # ---------------------------------------------------------
-    # IMPORTANT:
-    # Unknown labels (-1 / NaN) are NOT negative labels.
-    #
-    # For this first baseline we only use messages where every
-    # tactic has a known human/pseudo label.
-    # ---------------------------------------------------------
-
-    complete_mask = df[TACTICS].notna().all(axis=1)
-
-    complete_df = df[
-        complete_mask
-    ].copy()
-
-    print(
-        f"Messages with complete labels: "
-        f"{len(complete_df)}"
-    )
-
-    if len(complete_df) < 20:
-
-        raise ValueError(
-            "Too few completely labelled messages "
-            "for a meaningful baseline."
-        )
-
-    X = complete_df["message"].fillna("").astype(str)
-
-    Y = complete_df[TACTICS].astype(int)
-
-    # ---------------------------------------------------------
-    # Display class distribution
-    # ---------------------------------------------------------
-
-    print("\nClass distribution:")
-
-    for tactic in TACTICS:
-
-        positives = int(
-            Y[tactic].sum()
-        )
-
-        negatives = int(
-            len(Y) - positives
-        )
-
-        print(
-            f"{tactic:<25}"
-            f"Positive: {positives:<4}"
-            f"Negative: {negatives}"
-        )
-
-    # ---------------------------------------------------------
-    # Model
-    # ---------------------------------------------------------
-
-    model = Pipeline([
+def make_classifier():
+    return Pipeline([
         (
             "tfidf",
             TfidfVectorizer(
@@ -116,138 +41,131 @@ def main():
         ),
         (
             "classifier",
-            OneVsRestClassifier(
-                LogisticRegression(
-                    max_iter=2000,
-                    class_weight="balanced",
-                )
+            LogisticRegression(
+                max_iter=2000,
+                class_weight="balanced",
+                random_state=42,
             ),
         ),
     ])
 
-    # ---------------------------------------------------------
-    # Cross-validation
-    #
-    # We use KFold rather than StratifiedKFold because this is
-    # a multi-label problem.
-    # ---------------------------------------------------------
 
-    n_splits = min(
-        5,
-        len(complete_df)
-    )
-
-    cv = KFold(
-        n_splits=n_splits,
-        shuffle=True,
-        random_state=42,
-    )
-
-    print(
-        f"\nRunning {n_splits}-fold cross-validation..."
-    )
-
-    scoring = {
-        "micro_f1": "f1_micro",
-        "macro_f1": "f1_macro",
-        "micro_precision": "precision_micro",
-        "micro_recall": "recall_micro",
-    }
-
-    scores = cross_validate(
-        model,
-        X,
-        Y,
-        cv=cv,
-        scoring=scoring,
-        error_score="raise",
-    )
-
-    print("\n" + "=" * 70)
-    print("CROSS-VALIDATION RESULTS")
+def main():
+    print("=" * 70)
+    print("SCAMSHIELD - PARTIALLY LABELLED MULTI-TACTIC TRAINING")
     print("=" * 70)
 
-    for metric in scoring:
+    df = pd.read_csv(DATA_PATH)
+    print(f"\nTotal messages: {len(df)}")
 
-        values = scores[
-            f"test_{metric}"
-        ]
+    models = {}
+    thresholds = {}
+    evaluation_rows = []
+
+    for tactic in TACTICS:
+        print(f"\n{'-' * 60}\nTACTIC: {tactic}\n{'-' * 60}")
+
+        known = df[df[tactic].notna()].copy()
+        known[tactic] = pd.to_numeric(known[tactic], errors="raise").astype(int)
+
+        if not known[tactic].isin([0, 1]).all():
+            raise ValueError(f"Invalid labels found for {tactic}")
+
+        X = known["message"].fillna("").astype(str)
+        y = known[tactic]
+
+        counts = y.value_counts().to_dict()
+        positives = int((y == 1).sum())
+        negatives = int((y == 0).sum())
 
         print(
-            f"{metric:<20}"
-            f"{values.mean():.4f} "
-            f"+/- {values.std():.4f}"
+            f"Known: {len(known)} | "
+            f"Positive: {positives} | Negative: {negatives}"
         )
 
-    # ---------------------------------------------------------
-    # Train final baseline on all complete data
-    # ---------------------------------------------------------
+        if len(counts) < 2:
+            print("SKIPPED: requires both positive and negative examples.")
+            continue
 
-    print(
-        "\nTraining final baseline on all "
-        "complete labelled messages..."
-    )
+        # Evaluate only rows whose source is fully human.
+        # Mixed and pseudo-labelled rows are reserved for final fitting.
+        if "label_source" in known.columns:
+            eval_df = known[known["label_source"] == "human"].copy()
+        else:
+            eval_df = known.copy()
 
-    model.fit(
-        X,
-        Y
-    )
+        eval_y = eval_df[tactic].astype(int)
+        eval_counts = eval_y.value_counts()
 
-    # ---------------------------------------------------------
-    # Training-set diagnostic
-    #
-    # This is NOT a validation score.
-    # It only confirms that the pipeline works.
-    # ---------------------------------------------------------
+        if len(eval_counts) == 2 and eval_counts.min() >= 2:
+            folds = min(5, int(eval_counts.min()))
+            cv = StratifiedKFold(
+                n_splits=folds,
+                shuffle=True,
+                random_state=42,
+            )
 
-    predictions = model.predict(X)
+            eval_model = make_classifier()
+            pred = cross_val_predict(
+                eval_model,
+                eval_df["message"].fillna("").astype(str),
+                eval_y,
+                cv=cv,
+                method="predict",
+            )
+
+            print(f"Human-only {folds}-fold CV:")
+            print(f"  F1:        {f1_score(eval_y, pred, zero_division=0):.3f}")
+            print(
+                f"  Precision: "
+                f"{precision_score(eval_y, pred, zero_division=0):.3f}"
+            )
+            print(
+                f"  Recall:    "
+                f"{recall_score(eval_y, pred, zero_division=0):.3f}"
+            )
+        else:
+            print(
+                "CV skipped: too few human-labelled examples in one class "
+                "for reliable stratified evaluation."
+            )
+
+        if positives < 5:
+            print(
+                "WARNING: fewer than 5 positive examples; "
+                "predictions for this tactic will be highly uncertain."
+            )
+
+        model = make_classifier()
+        model.fit(X, y)
+
+        models[tactic] = model
+        thresholds[tactic] = 0.5
+
+    if not models:
+        raise ValueError("No tactic had both positive and negative labels.")
+
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    # Store a dictionary so predict.py can load each tactic classifier.
+    artifact = {
+        "model_type": "per_tactic_binary_v1",
+        "tactics": TACTICS,
+        "models": models,
+        "thresholds": thresholds,
+    }
+
+    joblib.dump(artifact, MODEL_PATH)
 
     print("\n" + "=" * 70)
-    print("TRAINING-SET DIAGNOSTIC")
+    print("TRAINING COMPLETE")
     print("=" * 70)
-
+    print("Trained classifiers:", len(models), "/", len(TACTICS))
+    print("Saved model:", MODEL_PATH)
     print(
-        classification_report(
-            Y,
-            predictions,
-            target_names=TACTICS,
-            zero_division=0,
-        )
+        "\nThese are experimental classifiers. "
+        "Rare classes need more reviewed examples."
     )
-
-    # ---------------------------------------------------------
-    # Save model
-    # ---------------------------------------------------------
-
-    import joblib
-
-    MODEL_DIR = (
-        ROOT
-        / "models"
-    )
-
-    MODEL_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    MODEL_PATH = (
-        MODEL_DIR
-        / "tfidf_multilabel_baseline.joblib"
-    )
-
-    joblib.dump(
-        model,
-        MODEL_PATH
-    )
-
-    print(
-        f"\nModel saved to:\n{MODEL_PATH}"
-    )
-
-    print("\n" + "=" * 70)
-    print("BASELINE TRAINING COMPLETE")
-    print("=" * 70)
 
 
 if __name__ == "__main__":
