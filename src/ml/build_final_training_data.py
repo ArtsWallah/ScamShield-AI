@@ -10,6 +10,9 @@ V4_PATH = ROOT / "data" / "processed" / "pseudo_labeled_tactics.csv"
 V5_PATH = ROOT / "data" / "processed" / "expanded_training_candidates.csv"
 
 OUTPUT_PATH = ROOT / "data" / "processed" / "final_training_data.csv"
+APPROVED_CORRECTIONS_PATH = (
+    ROOT / "data" / "processed" / "approved_label_corrections.csv"
+)
 
 TACTICS = [
     "authority",
@@ -227,6 +230,95 @@ def main():
     final_df = pd.DataFrame(
         list(records.values())
     )
+    # ---------------------------------------------------------
+    # Apply explicitly approved label corrections
+    # ---------------------------------------------------------
+
+    if not APPROVED_CORRECTIONS_PATH.exists():
+        raise FileNotFoundError(
+            f"Approved correction audit not found: "
+            f"{APPROVED_CORRECTIONS_PATH}"
+        )
+
+    corrections = pd.read_csv(APPROVED_CORRECTIONS_PATH)
+
+    required_audit_columns = {
+        "id",
+        "tactic",
+        "current_label",
+        "approved_label",
+        "approval_status",
+        "approval_basis",
+    }
+
+    missing_columns = required_audit_columns - set(corrections.columns)
+    if missing_columns:
+        raise ValueError(
+            f"Correction audit is missing columns: {sorted(missing_columns)}"
+        )
+
+    if len(corrections) != 15:
+        raise ValueError(
+            f"Expected 15 approved correction records; found {len(corrections)}"
+        )
+
+    if not corrections["approval_status"].eq("APPROVED_BY_USER").all():
+        raise ValueError("Every correction must be explicitly approved.")
+
+    if corrections.duplicated(["id", "tactic"]).any():
+        raise ValueError("Duplicate (id, tactic) entries in correction audit.")
+
+    if not corrections["tactic"].isin(TACTICS).all():
+        raise ValueError("Correction audit contains an unknown tactic.")
+
+    corrections["id"] = pd.to_numeric(
+        corrections["id"], errors="raise"
+    ).astype(int)
+
+    for _, correction in corrections.iterrows():
+        message_id = int(correction["id"])
+        tactic = str(correction["tactic"])
+        expected = pd.to_numeric(
+            pd.Series([correction["current_label"]]), errors="coerce"
+        ).iloc[0]
+        approved = pd.to_numeric(
+            pd.Series([correction["approved_label"]]), errors="coerce"
+        ).iloc[0]
+
+        if pd.isna(expected) or expected not in (0, 1):
+            raise ValueError(
+                f"Invalid recorded original label for ID {message_id}, {tactic}"
+            )
+
+        if pd.isna(approved) or approved not in (0, 1):
+            raise ValueError(
+                f"Invalid approved label for ID {message_id}, {tactic}"
+            )
+
+        matches = final_df.index[final_df["id"].eq(message_id)].tolist()
+        if len(matches) != 1:
+            raise ValueError(
+                f"Expected exactly one merged record for ID {message_id}; "
+                f"found {len(matches)}"
+            )
+
+        idx = matches[0]
+        actual = pd.to_numeric(
+            pd.Series([final_df.at[idx, tactic]]), errors="coerce"
+        ).iloc[0]
+
+        if pd.isna(actual) or actual != expected:
+            raise ValueError(
+                f"Stale/conflicting audit for ID {message_id}, {tactic}: "
+                f"expected original {expected}, found {actual}"
+            )
+
+        final_df.at[idx, tactic] = int(approved)
+
+        print(
+            f"Approved correction applied: ID {message_id}, "
+            f"{tactic}: {int(expected)} -> {int(approved)}"
+        )
 
     # ---------------------------------------------------------
     # Ensure consistent columns

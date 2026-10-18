@@ -1,5 +1,4 @@
-
-from pathlib import Path
+﻿from pathlib import Path
 
 import joblib
 import numpy as np
@@ -31,9 +30,16 @@ def test_prediction_returns_eight_outputs():
 
     assert len(prediction) == len(TACTICS) == 8
     assert len(scores) == 8
-    assert set(np.asarray(prediction).tolist()).issubset({0, 1})
-    assert np.isfinite(scores).all()
-    assert ((scores >= 0) & (scores <= 1)).all()
+
+    for tactic in TACTICS:
+        index = TACTICS.index(tactic)
+        if tactic not in artifact["models"]:
+            assert np.isnan(prediction[index])
+            assert np.isnan(scores[index])
+        else:
+            assert prediction[index] in (0, 1)
+            assert np.isfinite(scores[index])
+            assert 0 <= scores[index] <= 1
 
 
 def test_representative_messages_do_not_crash():

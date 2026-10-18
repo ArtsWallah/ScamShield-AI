@@ -30,8 +30,8 @@ def predict_message(model, message):
             classifier = model["models"].get(tactic)
 
             if classifier is None:
-                predictions.append(0)
-                probabilities.append(0.0)
+                predictions.append(np.nan)
+                probabilities.append(np.nan)
                 continue
 
             probability = float(
@@ -82,6 +82,11 @@ def main():
 
         for i, tactic in enumerate(TACTICS):
             score = float(probabilities[i])
+
+            if np.isnan(score):
+                print(f"{tactic:<25}{'UNAVAILABLE':<12}score=N/A")
+                continue
+
             label = int(prediction[i])
 
             print(
@@ -100,7 +105,7 @@ def main():
             for tactic in detected:
                 print(f"  - {tactic}")
         else:
-            print("No manipulation tactic detected.")
+            print("No positive prediction among available classifiers.")
 
         print(
             "\nNote: scores are model estimates, not calibrated fraud "
